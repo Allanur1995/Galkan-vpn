@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout repository
@@ -23,24 +23,36 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Set up Android SDK & Licenses
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK 36.1 & Build Tools
+      - name: Ensure Android SDK Licenses & Platform Tools
+        shell: bash
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-36.1" "build-tools;36.0.0"
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDKMANAGER=""
+          if command -v sdkmanager >/dev/null 2>&1; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          elif [ -n "$SDK_ROOT" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" "platform-tools" "build-tools;36.0.0" "platforms;android-36" >/dev/null 2>&1 || true
+            "$SDKMANAGER" "platforms;android-36.1" >/dev/null 2>&1 || true
+          fi
 
       - name: Set up Gradle 9.3.1
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '9.3.1'
 
       - name: Restore debug keystore
+        shell: bash
         run: |
           if [ ! -f debug.keystore ]; then
             if [ -f debug.keystore.base64 ]; then
-              base64 -d debug.keystore.base64 > debug.keystore
+              tr -d '[:space:]' < debug.keystore.base64 | base64 -d > debug.keystore
             else
               keytool -genkeypair -v -keystore debug.keystore \
                 -storepass android -alias androiddebugkey -keypass android \
@@ -48,8 +60,10 @@ jobs:
                 -dname "CN=Android Debug,O=Android,C=US"
             fi
           fi
+          ls -lh debug.keystore
 
       - name: Prepare .env from GitHub Secrets (fallback to test AdMob IDs)
+        shell: bash
         env:
           ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
           ADMOB_BANNER_ID: ${{ secrets.ADMOB_BANNER_ID }}
@@ -57,28 +71,40 @@ jobs:
           ADMOB_INTERSTITIAL_ID: ${{ secrets.ADMOB_INTERSTITIAL_ID }}
         run: |
           cp .env.example .env
-          if [ -n "$ADMOB_APP_ID" ]; then
-            sed -i "s|^ADMOB_APP_ID=.*|ADMOB_APP_ID=${ADMOB_APP_ID}|" .env
-          fi
-          if [ -n "$ADMOB_BANNER_ID" ]; then
-            sed -i "s|^ADMOB_BANNER_ID=.*|ADMOB_BANNER_ID=${ADMOB_BANNER_ID}|" .env
-          fi
-          if [ -n "$ADMOB_REWARDED_ID" ]; then
-            sed -i "s|^ADMOB_REWARDED_ID=.*|ADMOB_REWARDED_ID=${ADMOB_REWARDED_ID}|" .env
-          fi
-          if [ -n "$ADMOB_INTERSTITIAL_ID" ]; then
-            sed -i "s|^ADMOB_INTERSTITIAL_ID=.*|ADMOB_INTERSTITIAL_ID=${ADMOB_INTERSTITIAL_ID}|" .env
-          fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
 
-      - name: Run Unit Tests
-        run: gradle testDebugUnitTest --no-daemon
+          env_path = Path(".env")
+          lines = env_path.read_text(encoding="utf-8").splitlines()
+          overrides = {
+              k: os.environ.get(k, "")
+              for k in ("ADMOB_APP_ID", "ADMOB_BANNER_ID", "ADMOB_REWARDED_ID", "ADMOB_INTERSTITIAL_ID")
+              if os.environ.get(k, "").strip()
+          }
+          out = []
+          for line in lines:
+              replaced = False
+              for k, v in overrides.items():
+                  if line.startswith(f"{k}="):
+                      out.append(f"{k}={v}")
+                      replaced = True
+                      break
+              if not replaced:
+                  out.append(line)
+          env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+          PY
 
       - name: Build Debug APK
+        id: build_debug
         env:
           ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
         run: |
-          gradle assembleDebug --no-daemon
+          gradle assembleDebug --no-daemon --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk Galkan-VPN-debug.apk
+
+      - name: Run Unit Tests
+        run: gradle testDebugUnitTest --no-daemon --stacktrace
 
       - name: Build Signed Release APK & AAB (if keystore secrets provided)
         if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
@@ -90,11 +116,12 @@ jobs:
           ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
         run: |
           printf '%s' "$KEYSTORE_BASE64_VALUE" | tr -d '[:space:]' | base64 -d > "$KEYSTORE_PATH"
-          gradle assembleRelease bundleRelease --no-daemon
+          gradle assembleRelease bundleRelease --no-daemon --stacktrace
           cp app/build/outputs/apk/release/app-release.apk Galkan-VPN-release.apk
           cp app/build/outputs/bundle/release/app-release.aab Galkan-VPN-release.aab
 
       - name: Upload Debug APK Artifact
+        if: always() && steps.build_debug.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: Galkan-VPN-Debug-APK
@@ -111,8 +138,26 @@ jobs:
             Galkan-VPN-release.aab
           retention-days: 30
 
-      - name: Create GitHub Release on Tag Push
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    name: Create GitHub Release
+    needs: build-apk
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Debug APK
+        uses: actions/download-artifact@v4
+        with:
+          name: Galkan-VPN-Debug-APK
+
+      - name: Download Release Artifacts (if present)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: Galkan-VPN-Release-Signed
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
