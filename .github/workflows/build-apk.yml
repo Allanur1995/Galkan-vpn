@@ -2,10 +2,7 @@ name: Build Galkan VPN APK
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
   pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -20,37 +17,58 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK & Licenses
         uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36.1 & Build Tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36.1" "build-tools;36.0.0"
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
 
-      - name: Prepare .env from GitHub Secrets (fallback to test AdMob IDs)
+      - name: Restore debug keystore
         run: |
-          cp .env.example .env
-          if [ -n "${{ secrets.ADMOB_APP_ID }}" ]; then
-            sed -i "s|^ADMOB_APP_ID=.*|ADMOB_APP_ID=${{ secrets.ADMOB_APP_ID }}|" .env
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkeypair -v -keystore debug.keystore \
+                -storepass android -alias androiddebugkey -keypass android \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
           fi
-          if [ -n "${{ secrets.ADMOB_BANNER_ID }}" ]; then
-            sed -i "s|^ADMOB_BANNER_ID=.*|ADMOB_BANNER_ID=${{ secrets.ADMOB_BANNER_ID }}|" .env
-          fi
-          if [ -n "${{ secrets.ADMOB_REWARDED_ID }}" ]; then
-            sed -i "s|^ADMOB_REWARDED_ID=.*|ADMOB_REWARDED_ID=${{ secrets.ADMOB_REWARDED_ID }}|" .env
-          fi
-          if [ -n "${{ secrets.ADMOB_INTERSTITIAL_ID }}" ]; then
-            sed -i "s|^ADMOB_INTERSTITIAL_ID=.*|ADMOB_INTERSTITIAL_ID=${{ secrets.ADMOB_INTERSTITIAL_ID }}|" .env
-          fi
+
+      - name: Prepare .env from GitHub Secrets (fallback to test AdMob IDs)
         env:
           ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
+          ADMOB_BANNER_ID: ${{ secrets.ADMOB_BANNER_ID }}
+          ADMOB_REWARDED_ID: ${{ secrets.ADMOB_REWARDED_ID }}
+          ADMOB_INTERSTITIAL_ID: ${{ secrets.ADMOB_INTERSTITIAL_ID }}
+        run: |
+          cp .env.example .env
+          if [ -n "$ADMOB_APP_ID" ]; then
+            sed -i "s|^ADMOB_APP_ID=.*|ADMOB_APP_ID=${ADMOB_APP_ID}|" .env
+          fi
+          if [ -n "$ADMOB_BANNER_ID" ]; then
+            sed -i "s|^ADMOB_BANNER_ID=.*|ADMOB_BANNER_ID=${ADMOB_BANNER_ID}|" .env
+          fi
+          if [ -n "$ADMOB_REWARDED_ID" ]; then
+            sed -i "s|^ADMOB_REWARDED_ID=.*|ADMOB_REWARDED_ID=${ADMOB_REWARDED_ID}|" .env
+          fi
+          if [ -n "$ADMOB_INTERSTITIAL_ID" ]; then
+            sed -i "s|^ADMOB_INTERSTITIAL_ID=.*|ADMOB_INTERSTITIAL_ID=${ADMOB_INTERSTITIAL_ID}|" .env
+          fi
 
       - name: Run Unit Tests
         run: gradle testDebugUnitTest --no-daemon
@@ -62,15 +80,16 @@ jobs:
           gradle assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk Galkan-VPN-debug.apk
 
-      - name: Build Signed Release APK & AAB (if keystore secret provided)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      - name: Build Signed Release APK & AAB (if keystore secrets provided)
+        if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
         env:
+          KEYSTORE_BASE64_VALUE: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$KEYSTORE_PATH"
+          printf '%s' "$KEYSTORE_BASE64_VALUE" | tr -d '[:space:]' | base64 -d > "$KEYSTORE_PATH"
           gradle assembleRelease bundleRelease --no-daemon
           cp app/build/outputs/apk/release/app-release.apk Galkan-VPN-release.apk
           cp app/build/outputs/bundle/release/app-release.aab Galkan-VPN-release.aab
@@ -83,7 +102,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Release APK & AAB Artifacts
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: Galkan-VPN-Release-Signed
